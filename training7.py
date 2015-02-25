@@ -18,8 +18,8 @@ sys.setrecursionlimit(100000)
 IMG_SIZE = 96
 IMG_DIM = IMG_SIZE, IMG_SIZE
 DATABASE_FOLDER = '/upb/departments/pc2/scratch/thakur/'
-NETWORK = 'network6.pickle'
-SUBMISSION_FILE = 'submission_6.csv'
+NETWORK = 'network7.pickle'
+SUBMISSION_FILE = 'submission_7.csv'
 
 DUMP_LABEL = 'ndsb_label_dump'+ str(IMG_SIZE) +'.pkl'
 DUMP_TRAIN = 'ndsb_training_data_dump'+ str(IMG_SIZE) +'.pkl'
@@ -28,7 +28,7 @@ DUMP_TEST = 'ndsb_test_data_dump'+ str(IMG_SIZE) +'.pkl'
 LOAD_DUMP = False
 TRAIN  = True
 TEST = True
-UPDATE = False
+UPDATE = True
 
 sample = pd.read_csv(DATABASE_FOLDER + 'sampleSubmission.csv')
 columns = list(sample.columns)[1:]
@@ -185,7 +185,7 @@ class FlipBatchIterator(BatchIterator):
         for i in range(bs):
             Xb[i][0] = rotate(Xb[i][0], np.random.choice(angles))
             Xb[i][0] = rotate(Xb[i][0], np.random.choice(angles))
-            Xb[i][0] = rotate(Xb[i][0], np.random.choice(angles))	
+            Xb[i][0] = rotate(Xb[i][0], np.random.choice(angles))   
             Xb[i][0] = rotate(Xb[i][0], np.random.choice(angles))
             Xb[i][0] = rotate(Xb[i][0], np.random.choice(angles))
             Xb[i][0] = rotate(Xb[i][0], np.random.choice(angles))
@@ -277,7 +277,7 @@ if TRAIN:
             net2 = pickle.load(f)  
     net2.fit(X, y)
     with open(DATABASE_FOLDER + NETWORK, 'wb') as f:
-    	pickle.dump(net2, f, -1)
+        pickle.dump(net2, f, -1)
 
 
 def predict():
