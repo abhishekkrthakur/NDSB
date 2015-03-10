@@ -1,0 +1,347 @@
+import theano
+import numpy as np
+import matplotlib.pyplot as plt
+
+from sklearn.datasets import load_digits
+from sklearn.preprocessing import LabelBinarizer
+from lasagne import layers
+from lasagne.updates import nesterov_momentum
+from lasagne.nonlinearities import softmax
+from nolearn.lasagne import NeuralNet
+Conv2DLayer = layers.cuda_convnet.Conv2DCCLayer
+MaxPool2DLayer = layers.cuda_convnet.MaxPool2DCCLayer
+import pandas as pd
+
+
+import time
+def timestamp():
+    return "_".join([str(k).zfill(2) for k in time.localtime()][0:5])
+
+def show_image(img):
+    plt.axis('off')
+    plt.imshow(img, cmap='gray', interpolation='nearest')
+
+def float32(k):
+    return np.cast['float32'](k)
+
+class AdjustVariable(object):
+    def __init__(self, name, start=0.03, stop=0.001):
+        self.name = name
+        self.start, self.stop = start, stop
+        self.ls = None
+
+    def __call__(self, nn, train_history):
+        if self.ls is None:
+            self.ls = np.linspace(self.start, self.stop, nn.max_epochs)
+
+        epoch = train_history[-1]['epoch']
+        new_value = float32(self.ls[epoch - 1])
+        setattr(nn, self.name, new_value)
+
+class EarlyStopping(object):
+    def __init__(self, patience=100):
+        self.patience = patience
+        self.best_valid = np.inf
+        self.best_valid_epoch = 0
+        self.best_weights = None
+
+    def __call__(self, nn, train_history):
+        current_valid = train_history[-1]['valid_loss']
+        current_epoch = train_history[-1]['epoch']
+        if current_valid < self.best_valid:
+            self.best_valid = current_valid
+            self.best_valid_epoch = current_epoch
+            self.best_weights = [w.get_value() for w in nn.get_all_params()]
+        elif self.best_valid_epoch + self.patience < current_epoch:
+            print("Early stopping.")
+            print("Best valid loss was {:.6f} at epoch {}.".format(
+                self.best_valid, self.best_valid_epoch))
+            nn.load_weights_from(self.best_weights)
+            raise StopIteration()
+
+import glob
+import os
+import matplotlib.pyplot as plt
+
+classes = np.asarray([d.split('/')[1] for d in glob.glob('train/*')])
+def load_filenames(base_dir, class_name):
+    return [f.split('/')[2] for f in glob.glob(os.path.join(base_dir, class_name, '*.jpg'))]
+
+def count_files(set_name, class_name):
+    return len(load_filenames(set_name, class_name))
+
+num_files = sum(count_files('train', c) for c in classes)
+num_classes = len(classes)
+
+print 'Number of classes:', num_classes
+print 'Number of images:', num_files
+
+DATA_DIR = '/home/mvonrohr/kaggle/plankton/'
+IMG_SIZE = 128
+IMG_DIM = IMG_SIZE, IMG_SIZE
+
+from skimage.filter import threshold_adaptive
+from skimage.exposure import equalize_adapthist
+from skimage.restoration import denoise_tv_chambolle, denoise_bilateral
+from skimage.filter import sobel
+from skimage.io import imread
+from skimage.transform import resize
+from skimage.filter.rank import median
+from skimage.morphology import disk
+
+def place_center(img, shape):
+    w, h = img.shape
+    nw, nh = shape
+    new_img = np.zeros(shape, dtype=img.dtype)
+    x = nw / 2 - w / 2
+    y = nh / 2 - h / 2
+    #print 'reshaping to', (nw, nh), 'origin at', (x, y), (w, h), new_img.shape
+    new_img[x:x+w, y:y+h] = img
+    return new_img
+
+def pre_process(img):
+    img = (255 - img)
+    s = max(img.shape)
+    img = place_center(img, (s, s))
+    img = resize(img, IMG_DIM)
+    return img.astype(np.float32)
+
+import os, fnmatch
+def find_files(directory, pattern):
+    for root, dirs, files in os.walk(directory):
+        for basename in files:
+            if fnmatch.fnmatch(basename, pattern):
+                filename = os.path.join(root, basename)
+                yield filename
+
+def load_train_data():
+    for f in list(find_files(DATA_DIR + 'train/', '*.jpg')):
+        class_name = f.split('/')[1]
+        img = imread(f)
+        yield class_name, pre_process(img)
+           
+def load_train():
+    train = []
+    train_label = []
+    for i, (label, img) in enumerate(load_train_data()):
+        train.append(img)
+        train_label.append(label)
+        if i % 2000 == 0:
+            print i,
+
+    train = np.asarray(train)
+    train_label = np.asarray(train_label)
+    
+    return train, train_label
+
+train, train_label = load_train()
+
+idx = np.arange(len(train))
+np.random.shuffle(idx)
+X = (train.reshape(-1, 1, IMG_SIZE, IMG_SIZE)).astype(np.float32)[idx]
+y = train_label[idx]
+
+print X.shape, X.dtype, X.max(), X.min(), y
+
+from os.path import basename
+
+def load_test_data():
+    for f in glob.glob(DATA_DIR + 'test/*.jpg'):
+        img = imread(f)
+        id = basename(f).split('.jpg')[0]
+        yield id, pre_process(img)
+
+def load_test():
+    data = []
+    ids = []
+    for i, (id, img) in enumerate(load_test_data()):
+        ids.append(id)
+        data.append(img)
+        if i % 1000 == 0:
+            print i,
+
+    return (np.asarray(ids), np.asarray(data).reshape(-1, 1, IMG_SIZE, IMG_SIZE))
+
+ids, X_test = load_test()
+X_test.shape, X_test.dtype
+
+import skimage.transform as transform
+import skimage
+
+def fast_warp(img, tf, output_shape=IMG_DIM, mode='nearest'):
+    """
+    This wrapper function is about five times faster than skimage.transform.warp, for our use case.
+    """
+    m = tf.params
+    img_wf = np.empty((output_shape[0], output_shape[1]), dtype='float32')
+    img_wf = skimage.transform._warps_cy._warp_fast(img, m, output_shape=output_shape, mode=mode)
+    return img_wf
+
+def random_perturbation_transform(zoom_range, rotation_range, shear_range, translation_range, do_flip=False):
+    # random shift [-4, 4] - shift no longer needs to be integer!
+    shift_x = np.random.uniform(*translation_range)
+    shift_y = np.random.uniform(*translation_range)
+    translation = (shift_x, shift_y)
+
+    # random rotation [0, 360]
+    rotation = np.random.uniform(*rotation_range) # there is no post-augmentation, so full rotations here!
+
+    # random shear [0, 5]
+    shear = np.random.uniform(low=shear_range[0], high=shear_range[1])
+
+    # random zoom [0.9, 1.1]
+    # zoom = np.random.uniform(*zoom_range)
+    log_zoom_range = [np.log(z) for z in zoom_range]
+    zoom = np.exp(np.random.uniform(*log_zoom_range)) # for a zoom factor this sampling approach makes more sense.
+    # the range should be multiplicatively symmetric, so [1/1.1, 1.1] instead of [0.9, 1.1] makes more sense.
+
+    # flip
+    if do_flip:
+        shear += 180
+        rotation += 180
+
+    return build_augmentation_transform(zoom, rotation, shear, translation)
+
+
+def build_augmentation_transform(zoom=1.0, rotation=0, shear=0, translation=(0, 0)):
+    center_shift = np.array(IMG_DIM) / 2. - 0.5
+    tform_center = transform.SimilarityTransform(translation=-center_shift)
+    tform_uncenter = transform.SimilarityTransform(translation=center_shift)
+
+    tform_augment = transform.AffineTransform(scale=(1/zoom, 1/zoom), 
+                                              rotation=np.deg2rad(rotation), 
+                                              shear=np.deg2rad(shear), 
+                                              translation=translation)
+    tform = tform_center + tform_augment + tform_uncenter 
+    return tform
+
+
+augmentation_params = {
+            'zoom_range': (1.0, 1.1),
+            'rotation_range': (0, 360),
+            'shear_range': (0, 5),
+            'translation_range': (-4, 4),
+        }
+
+def transform_randomly(X, plot = False):
+    X = X.copy()
+    tform_augment = random_perturbation_transform(**augmentation_params)
+    tform_identity = skimage.transform.AffineTransform()
+    tform_ds = skimage.transform.AffineTransform()
+
+    for i in range(X.shape[0]):
+        new = fast_warp(X[i][0], tform_ds + tform_augment + tform_identity, 
+                             output_shape=IMG_DIM, mode='nearest').astype('float32')
+        X[i,:] = new
+
+    return X
+
+from nolearn.lasagne import BatchIterator
+
+class FlipBatchIterator(BatchIterator):
+    def transform(self, Xb, yb):
+        Xb, yb = super(FlipBatchIterator, self).transform(Xb, yb)
+        Xb = transform_randomly(Xb)
+
+        return Xb, yb
+
+import lasagne 
+net2 = NeuralNet(
+    layers=[
+        ('input', layers.InputLayer),
+        ('conv1', Conv2DLayer),
+        ('pool1', MaxPool2DLayer),
+        ('conv2', Conv2DLayer),
+        ('conv3', Conv2DLayer),
+        ('pool3', MaxPool2DLayer),
+        ('hidden1', layers.DenseLayer),
+        ('dropout1', layers.DropoutLayer),
+        ('hidden2', layers.DenseLayer),
+        ('dropout2', layers.DropoutLayer),
+        ('hidden3', layers.DenseLayer),
+        ('dropout3', layers.DropoutLayer),
+        ('output', layers.DenseLayer),
+        ],
+    input_shape=(None, 1, IMG_SIZE, IMG_SIZE),
+
+    conv1_num_filters=128, 
+    conv1_filter_size=(5, 5), 
+    conv1_pad=2, 
+    conv1_strides=(4,4), 
+    conv1_nonlinearity=lasagne.nonlinearities.rectify, 
+
+    pool1_ds=(3, 3),
+    pool1_strides=(2,2),
+
+    conv2_num_filters=128, 
+    conv2_filter_size=(3, 3), 
+    conv2_pad=2, 
+    conv2_nonlinearity=lasagne.nonlinearities.rectify,
+
+    conv3_num_filters=256, 
+    conv3_filter_size=(3, 3),
+    conv3_pad=1, 
+    conv3_nonlinearity=lasagne.nonlinearities.rectify, 
+
+    pool3_ds=(3, 3),
+    pool3_strides=(2,2),
+
+    hidden1_num_units=512,
+    hidden1_nonlinearity=lasagne.nonlinearities.rectify,
+
+    dropout1_p=0.3,
+
+    hidden2_num_units=1024,
+    hidden2_nonlinearity=lasagne.nonlinearities.rectify, 
+
+    dropout2_p=0.5,
+
+    hidden3_num_units=1024,
+    hidden3_nonlinearity=lasagne.nonlinearities.rectify, 
+
+    dropout3_p=0.5,
+
+    output_num_units=121, 
+    output_nonlinearity=lasagne.nonlinearities.softmax,
+
+    update_learning_rate=theano.shared(float32(0.01)),
+    update_momentum=theano.shared(float32(0.9)),
+
+    regression=False,
+    #loss=lasagne.objectives.multinomial_nll,
+    use_label_encoder=True,
+    batch_iterator_train=FlipBatchIterator(batch_size=256),
+    
+    on_epoch_finished=[
+        AdjustVariable('update_learning_rate', start=0.01, stop=0.0001),
+        AdjustVariable('update_momentum', start=0.9, stop=0.999),
+        EarlyStopping(patience=50),
+        ],
+    max_epochs=500,
+    verbose=2,
+    test_size=0.1
+    )
+
+net2.fit(X, y)
+
+import sys
+sys.setrecursionlimit(10000)
+import cPickle as pickle
+dump_name = 'net_{}.pickle'.format(min([d['valid_loss'] for d in net2.train_history_]))
+with open(dump_name, 'wb') as f:
+    pickle.dump(net2, f, -1)
+
+y_test = net2.predict_proba(X_test)
+for i in range(20):
+    print i, 'T',
+    Xt = transform_randomly(X_test)
+    print 'P',
+    y_test += net2.predict_proba(Xt)
+
+y_test /= 20.0
+
+submission_filename = 'submission_{}'.format(timestamp())
+submission = pd.DataFrame(y_test, index=[id + '.jpg' for id in ids], columns=net2.enc_.classes_)
+submission.to_csv(submission_filename + '.csv', index_label='image')
+print 'submission:', submission_filename, '.csv'
+
